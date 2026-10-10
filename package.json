@@ -1,0 +1,9 @@
+{
+  "name": "kasjer3d-server",
+  "version": "1.0.0",
+  "description": "Serwer multiplayer (Socket.IO) do gry Kasjer 3D",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "socket.io": "^4.7.5" }
+}

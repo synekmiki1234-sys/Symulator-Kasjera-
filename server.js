@@ -12,7 +12,7 @@ const rooms = new Map();           // id -> { id, name, max, need, hostId, start
 let RID = 0;
 const clean = (s, n) => String(s || '').replace(/[<>&"'`]/g, '').trim().slice(0, n);
 const plist = r => [...r.players].map(([id, nick]) => ({ id, nick }));
-const pub = r => ({ id: r.id, name: r.name, cur: r.players.size, max: r.max, need: r.need, started: r.started });
+const pub = r => ({ id: r.id, name: r.name, cur: r.players.size, max: r.max, need: r.need, started: r.started, ver: r.ver });
 const state = r => ({ ...pub(r), hostId: r.hostId, players: plist(r) });
 const list = () => [...rooms.values()].map(pub);
 let lastPush = 0, pushTimer = null;
@@ -45,7 +45,7 @@ io.on('connection', s => {
   s.on('lobby:create', (d, ack) => {
     if (typeof ack !== 'function') return; d = d || {}; leave(s);
     const max = Math.max(2, Math.min(50, (d.max | 0) || 10)), need = Math.max(2, Math.min(max, (d.need | 0) || 2));
-    const r = { id: 'r' + (++RID), name: clean(d.name, 24) || 'Lobby ' + RID, max, need, hostId: s.id, started: false, players: new Map([[s.id, clean(d.nick, 14) || 'Gracz']]) };
+    const r = { id: 'r' + (++RID), name: clean(d.name, 24) || 'Lobby ' + RID, max, need, hostId: s.id, started: false, ver: d.ver | 0, players: new Map([[s.id, clean(d.nick, 14) || 'Gracz']]) };
     rooms.set(r.id, r); s.join(r.id); s.data.room = r.id;
     ack({ ok: true }); io.to(r.id).emit('lobby:state', state(r)); pushList();
   });
@@ -55,6 +55,7 @@ io.on('connection', s => {
     let r = d.id ? rooms.get(d.id) : null;
     if (!r && d.name) { const q = clean(d.name, 24).toLowerCase(); r = [...rooms.values()].find(x => x.name.toLowerCase() === q) || [...rooms.values()].find(x => x.name.toLowerCase().includes(q)); }
     if (!r) return ack({ ok: false, err: 'nf' });
+    if (r.ver && (d.ver | 0) !== r.ver) return ack({ ok: false, err: 'ver', hv: r.ver });   // inna wersja gry niż u hosta
     if (r.players.has(s.id)) return ack({ ok: true });
     if (r.players.size >= r.max) return ack({ ok: false, err: 'full' });
     leave(s); r.players.set(s.id, clean(d.nick, 14) || 'Gracz'); s.join(r.id); s.data.room = r.id;

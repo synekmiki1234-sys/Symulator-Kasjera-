@@ -45,7 +45,7 @@ io.on('connection', s => {
   s.on('lobby:create', (d, ack) => {
     if (typeof ack !== 'function') return; d = d || {}; leave(s);
     const max = Math.max(2, Math.min(50, (d.max | 0) || 10)), need = Math.max(2, Math.min(max, (d.need | 0) || 2));
-    const r = { id: 'r' + (++RID), name: clean(d.name, 24) || 'Lobby ' + RID, max, need, hostId: s.id, started: false, players: new Map([[s.id, clean(d.nick, 12) || 'Gracz']]) };
+    const r = { id: 'r' + (++RID), name: clean(d.name, 24) || 'Lobby ' + RID, max, need, hostId: s.id, started: false, players: new Map([[s.id, clean(d.nick, 14) || 'Gracz']]) };
     rooms.set(r.id, r); s.join(r.id); s.data.room = r.id;
     ack({ ok: true }); io.to(r.id).emit('lobby:state', state(r)); pushList();
   });
@@ -57,13 +57,19 @@ io.on('connection', s => {
     if (!r) return ack({ ok: false, err: 'nf' });
     if (r.players.has(s.id)) return ack({ ok: true });
     if (r.players.size >= r.max) return ack({ ok: false, err: 'full' });
-    leave(s); r.players.set(s.id, clean(d.nick, 12) || 'Gracz'); s.join(r.id); s.data.room = r.id;
+    leave(s); r.players.set(s.id, clean(d.nick, 14) || 'Gracz'); s.join(r.id); s.data.room = r.id;
     ack({ ok: true }); io.to(r.id).emit('lobby:state', state(r));
     if (r.started) s.emit('g:start', { hostId: r.hostId, players: plist(r) });   // dołączanie w trakcie gry
     pushList();
   });
 
   s.on('lobby:leave', () => leave(s));
+
+  s.on('nick', n => {
+    const r = rooms.get(s.data.room), nick = clean(n, 14);
+    if (!r || !nick || !r.players.has(s.id)) return;
+    r.players.set(s.id, nick); io.to(r.id).emit('lobby:state', state(r));
+  });
 
   s.on('lobby:start', () => {
     const r = rooms.get(s.data.room);

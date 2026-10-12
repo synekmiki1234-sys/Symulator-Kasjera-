@@ -1,53 +1,101 @@
 // Kasjer 3D – serwer multiplayer (Socket.IO). Uruchom: npm install && npm start
-// Model gry: host-authoritative. Host (tworzący lobby) liczy symulację sklepu, serwer tylko
-// zarządza lobby i przekazuje wiadomości między graczami jednego pokoju.
-const http = require('http');
+// - lobby są TRWAŁE: nie znikają, gdy twórca wyjdzie (zapis w pliku, domyślnie ./lobbies.json)
+// - hasło do lobby, usuwanie lobby przez właściciela, zapis stanu gry (host wysyła go co kilka sekund)
+// - przejęcie roli hosta, gdy host wyjdzie, czat tekstowy i sygnalizacja voicechatu (WebRTC)
+// UWAGA: darmowy hosting z ulotnym dyskiem (np. Render Free) kasuje plik przy każdym wdrożeniu/uśpieniu.
+//        Ustaw zmienną DATA_FILE na ścieżkę na trwałym dysku, jeśli chcesz mieć zapisy na stałe.
+const http = require('http'), fs = require('fs'), crypto = require('crypto');
 const { Server } = require('socket.io');
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000, FILE = process.env.DATA_FILE || './lobbies.json';
+const IDLE_DAYS = 14;
 
 const srv = http.createServer((req, res) => { res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end('Kasjer 3D multiplayer server OK'); });
 const io = new Server(srv, { cors: { origin: '*' }, maxHttpBufferSize: 2e5, pingInterval: 10000, pingTimeout: 15000 });
 
-const rooms = new Map();           // id -> { id, name, max, need, hostId, started, players: Map(socketId -> nick) }
+const rooms = new Map();
 let RID = 0;
-const clean = (s, n) => String(s || '').replace(/[<>&"'`]/g, '').trim().slice(0, n);
-const plist = r => [...r.players].map(([id, nick]) => ({ id, nick }));
-const pub = r => ({ id: r.id, name: r.name, cur: r.players.size, max: r.max, need: r.need, started: r.started, ver: r.ver });
-const state = r => ({ ...pub(r), hostId: r.hostId, players: plist(r) });
-const list = () => [...rooms.values()].map(pub);
+const clean = (s, n) => String(s == null ? '' : s).replace(/[<>&"'`]/g, '').trim().slice(0, n);
+const hash = (v, salt) => crypto.scryptSync(String(v), salt, 32).toString('hex');
+
+// ---------- zapis na dysk ----------
+function loadRooms() {
+  try {
+    JSON.parse(fs.readFileSync(FILE, 'utf8')).forEach(r => {
+      r.players = new Map(); r.hostId = null; r.voice = new Set();
+      rooms.set(r.id, r); RID = Math.max(RID, parseInt(String(r.id).slice(1), 10) || 0);
+    });
+    console.log('Wczytano lobby:', rooms.size);
+  } catch (e) { /* pierwszy start */ }
+}
+let dirty = null;
+function persist() {
+  clearTimeout(dirty);
+  dirty = setTimeout(() => {
+    try {
+      fs.writeFileSync(FILE, JSON.stringify([...rooms.values()].map(r => ({
+        id: r.id, name: r.name, max: r.max, need: r.need, ver: r.ver, started: r.started,
+        ownerH: r.ownerH, passH: r.passH, salt: r.salt, save: r.save, last: r.last }))));
+    } catch (e) { console.log('Zapis nieudany:', e.message); }
+  }, 2000);
+}
+loadRooms();
+
+// ---------- widoki ----------
+const plist = r => [...r.players].map(([id, p]) => ({ id, nick: p.nick }));
+const pub = (r, owner) => ({ id: r.id, name: r.name, cur: r.players.size, max: r.max, need: r.need, started: r.started, ver: r.ver,
+  lock: !!r.passH, mine: !!(owner && r.ownerH && hash(owner, 'o') === r.ownerH) });
+const state = r => ({ ...pub(r), hostId: r.hostId, players: plist(r), own: [...r.players].filter(([, p]) => p.own).map(([id]) => id) });
 let lastPush = 0, pushTimer = null;
 function pushList() {
   const now = Date.now();
   if (now - lastPush < 300) { clearTimeout(pushTimer); pushTimer = setTimeout(pushList, 300); return; }
-  lastPush = now; io.emit('lobbies', list());
+  lastPush = now; io.emit('lobbies', [...rooms.values()].map(r => pub(r)));
 }
+
+// ---------- wyjście z lobby ----------
 function leave(s) {
   const rid = s.data.room; if (!rid) return;
   const r = rooms.get(rid); s.leave(rid); s.data.room = null; if (!r) return;
-  r.players.delete(s.id);
-  if (r.players.size === 0) { rooms.delete(rid); }
-  else if (s.id === r.hostId) {
-    if (r.started) {                       // host wyszedł z trwającej gry -> koniec dla wszystkich
-      io.to(rid).emit('g:end', { why: 'host' });
-      for (const id of r.players.keys()) { const o = io.sockets.sockets.get(id); if (o) { o.leave(rid); o.data.room = null; } }
-      rooms.delete(rid);
-    } else {                               // w poczekalni -> nowy host
-      r.hostId = r.players.keys().next().value; io.to(rid).emit('lobby:state', state(r));
+  if (r.voice && r.voice.delete(s.id)) io.to(rid).emit('voice:left', { id: s.id });
+  r.players.delete(s.id); r.last = Date.now();
+  if (r.players.size === 0) { r.hostId = null; }                       // lobby ZOSTAJE (z zapisem gry)
+  else {
+    if (s.id === r.hostId) {                                          // przejęcie roli hosta
+      r.hostId = r.players.keys().next().value;
+      if (r.started) io.to(rid).emit('g:host', { hostId: r.hostId, save: r.save });
     }
-  } else { io.to(rid).emit('g:left', { id: s.id }); io.to(rid).emit('lobby:state', state(r)); }
-  pushList();
+    io.to(rid).emit('g:left', { id: s.id });
+    io.to(rid).emit('lobby:state', state(r));
+  }
+  pushList(); persist();
+}
+function join(s, r, d, own) {
+  leave(s);
+  if (r.players.size === 0) { r.ver = d.ver | 0 || r.ver; }          // puste lobby przyjmuje wersję wchodzącego
+  r.players.set(s.id, { nick: clean(d.nick, 14) || 'Gracz', own });
+  s.join(r.id); s.data.room = r.id; r.last = Date.now();
+  const noHost = !r.hostId || !r.players.has(r.hostId);
+  if (noHost) r.hostId = s.id;
+  io.to(r.id).emit('lobby:state', state(r));
+  if (r.started) s.emit('g:start', { hostId: r.hostId, players: plist(r), save: noHost ? r.save : null });
+  pushList(); persist();
 }
 
 io.on('connection', s => {
-  s.data.room = null;
-  s.on('lobbies:get', (_, ack) => { if (typeof ack === 'function') ack(list()); });
+  s.data.room = null; s.data.lastChat = 0;
+  const isOwner = (r, tok) => !!(tok && r.ownerH && hash(tok, 'o') === r.ownerH);
+
+  s.on('lobbies:get', (d, ack) => { if (typeof ack === 'function') ack([...rooms.values()].map(r => pub(r, d && d.owner))); });
 
   s.on('lobby:create', (d, ack) => {
-    if (typeof ack !== 'function') return; d = d || {}; leave(s);
+    if (typeof ack !== 'function') return; d = d || {};
     const max = Math.max(2, Math.min(50, (d.max | 0) || 10)), need = Math.max(2, Math.min(max, (d.need | 0) || 2));
-    const r = { id: 'r' + (++RID), name: clean(d.name, 24) || 'Lobby ' + RID, max, need, hostId: s.id, started: false, ver: d.ver | 0, players: new Map([[s.id, clean(d.nick, 14) || 'Gracz']]) };
-    rooms.set(r.id, r); s.join(r.id); s.data.room = r.id;
-    ack({ ok: true }); io.to(r.id).emit('lobby:state', state(r)); pushList();
+    const salt = crypto.randomBytes(8).toString('hex'), pass = typeof d.pass === 'string' ? d.pass.slice(0, 24) : '';
+    const r = { id: 'r' + (++RID), name: clean(d.name, 24) || 'Lobby ' + RID, max, need, ver: d.ver | 0, started: false, save: null,
+      ownerH: d.owner ? hash(d.owner, 'o') : null, salt, passH: pass ? hash(pass, salt) : null, last: Date.now(),
+      players: new Map(), hostId: null, voice: new Set() };
+    rooms.set(r.id, r);
+    join(s, r, d, true); ack({ ok: true, id: r.id });
   });
 
   s.on('lobby:join', (d, ack) => {
@@ -55,40 +103,82 @@ io.on('connection', s => {
     let r = d.id ? rooms.get(d.id) : null;
     if (!r && d.name) { const q = clean(d.name, 24).toLowerCase(); r = [...rooms.values()].find(x => x.name.toLowerCase() === q) || [...rooms.values()].find(x => x.name.toLowerCase().includes(q)); }
     if (!r) return ack({ ok: false, err: 'nf' });
-    if (r.ver && (d.ver | 0) !== r.ver) return ack({ ok: false, err: 'ver', hv: r.ver });   // inna wersja gry niż u hosta
+    const own = isOwner(r, d.owner);
+    if (r.passH && !own && !(typeof d.pass === 'string' && hash(d.pass, r.salt) === r.passH)) return ack({ ok: false, err: 'pass' });
     if (r.players.has(s.id)) return ack({ ok: true });
+    if (r.players.size > 0 && r.ver && (d.ver | 0) !== r.ver) return ack({ ok: false, err: 'ver', hv: r.ver });
     if (r.players.size >= r.max) return ack({ ok: false, err: 'full' });
-    leave(s); r.players.set(s.id, clean(d.nick, 14) || 'Gracz'); s.join(r.id); s.data.room = r.id;
-    ack({ ok: true }); io.to(r.id).emit('lobby:state', state(r));
-    if (r.started) s.emit('g:start', { hostId: r.hostId, players: plist(r) });   // dołączanie w trakcie gry
-    pushList();
+    join(s, r, d, own); ack({ ok: true });
   });
 
   s.on('lobby:leave', () => leave(s));
 
+  s.on('lobby:delete', (d, ack) => {
+    d = d || {}; const r = rooms.get(d.id);
+    if (!r || !isOwner(r, d.owner)) return typeof ack === 'function' && ack({ ok: false });
+    io.to(r.id).emit('g:end', { why: 'deleted' });
+    for (const id of r.players.keys()) { const o = io.sockets.sockets.get(id); if (o) { o.leave(r.id); o.data.room = null; } }
+    rooms.delete(r.id); pushList(); persist(); if (typeof ack === 'function') ack({ ok: true });
+  });
+
   s.on('nick', n => {
-    const r = rooms.get(s.data.room), nick = clean(n, 14);
-    if (!r || !nick || !r.players.has(s.id)) return;
-    r.players.set(s.id, nick); io.to(r.id).emit('lobby:state', state(r));
+    const r = rooms.get(s.data.room), nick = clean(n, 14), p = r && r.players.get(s.id);
+    if (!p || !nick) return;
+    p.nick = nick; io.to(r.id).emit('lobby:state', state(r));
   });
 
   s.on('lobby:start', () => {
     const r = rooms.get(s.data.room);
     if (!r || r.hostId !== s.id || r.started || r.players.size < r.need) return;
-    r.started = true; io.to(r.id).emit('g:start', { hostId: r.hostId, players: plist(r) }); pushList();
+    r.started = true; r.last = Date.now();
+    io.to(r.id).emit('g:start', { hostId: r.hostId, players: plist(r), save: r.save }); pushList(); persist();
   });
 
-  // --- przekaźniki gry ---
+  // ---------- gra ----------
   s.on('g:pos', d => { const rid = s.data.room; if (rid && d && typeof d === 'object') s.to(rid).volatile.emit('g:pos', { id: s.id, x: +d.x, y: +d.y, z: +d.z, yaw: +d.yaw, mv: d.mv ? 1 : 0, att: d.att ? 1 : 0, cp: d.cp | 0 }); });
   s.on('g:state', d => { const r = rooms.get(s.data.room); if (r && r.hostId === s.id) s.to(r.id).volatile.emit('g:state', d); });
   s.on('g:ev', d => { const r = rooms.get(s.data.room); if (r && r.hostId === s.id) s.to(r.id).emit('g:ev', d); });
+  s.on('g:save', d => {   // zapis stanu świata przez hosta (przetrwa wyjście wszystkich graczy)
+    const r = rooms.get(s.data.room);
+    if (!r || r.hostId !== s.id || !d || typeof d !== 'object') return;
+    let js = ''; try { js = JSON.stringify(d); } catch (e) { return; }
+    if (js.length > 60000) return;
+    r.save = d; r.last = Date.now(); persist();
+  });
   s.on('g:act', (m, ack) => {
     const r = rooms.get(s.data.room); if (!r || !r.started || !m || typeof m !== 'object') return ack && ack({ ok: false });
     const host = io.sockets.sockets.get(r.hostId); if (!host) return ack && ack({ ok: false });
     host.timeout(3000).emit('g:act', { from: s.id, t: String(m.t), d: m.d }, (err, res) => { if (typeof ack === 'function') ack(err ? { ok: false } : res); });
   });
 
+  // ---------- czat ----------
+  s.on('chat', txt => {
+    const r = rooms.get(s.data.room), p = r && r.players.get(s.id), now = Date.now();
+    if (!p || now - s.data.lastChat < 400) return;
+    const text = clean(txt, 140); if (!text) return;
+    s.data.lastChat = now; io.to(r.id).emit('chat', { id: s.id, nick: p.nick, text });
+  });
+
+  // ---------- voicechat (tylko sygnalizacja WebRTC) ----------
+  s.on('voice:join', (_, ack) => {
+    const r = rooms.get(s.data.room); if (!r) return typeof ack === 'function' && ack([]);
+    const others = [...r.voice].filter(id => id !== s.id); r.voice.add(s.id);
+    if (typeof ack === 'function') ack(others);
+  });
+  s.on('voice:leave', () => { const r = rooms.get(s.data.room); if (r && r.voice.delete(s.id)) io.to(r.id).emit('voice:left', { id: s.id }); });
+  s.on('rtc', m => {
+    const r = rooms.get(s.data.room); if (!r || !m || !r.players.has(m.to)) return;
+    const o = io.sockets.sockets.get(m.to); if (o) o.emit('rtc', { from: s.id, d: m.d });
+  });
+
   s.on('disconnect', () => leave(s));
 });
+
+// sprzątanie starych, pustych lobby
+setInterval(() => {
+  const lim = Date.now() - IDLE_DAYS * 864e5; let ch = false;
+  for (const [id, r] of rooms) if (r.players.size === 0 && (r.last || 0) < lim) { rooms.delete(id); ch = true; }
+  if (ch) { persist(); pushList(); }
+}, 6 * 3600e3);
 
 srv.listen(PORT, () => console.log('Kasjer 3D server listening on :' + PORT));

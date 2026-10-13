@@ -8,12 +8,17 @@ const http = require('http'), fs = require('fs'), crypto = require('crypto');
 const { Server } = require('socket.io');
 const PORT = process.env.PORT || 3000, FILE = process.env.DATA_FILE || './lobbies.json';
 const IDLE_DAYS = 14;
+// Konta admina: serwer trzyma tylko SKRÓT kodu (SHA-256). Możesz go nadpisać zmienną ADMIN_HASH.
+const ADMIN_HASH = process.env.ADMIN_HASH || '469344aecb748d2b606122291e9814d793b8c001a875d6f3b24a015e7a02e8d3';
+const ADMINS = ['Czorii', 'INFECTION'], RESERVED = { czorii: 1, infection: 1 };
+const sha = x => crypto.createHash('sha256').update(String(x)).digest('hex');
 
 const srv = http.createServer((req, res) => { res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end('Kasjer 3D multiplayer server OK'); });
 const io = new Server(srv, { cors: { origin: '*' }, maxHttpBufferSize: 2e5, pingInterval: 10000, pingTimeout: 15000 });
 
 const rooms = new Map();
 let RID = 0;
+const fixNick = (s, nick) => s.data.admin ? s.data.admin : (RESERVED[nick.toLowerCase()] ? nick + '_' : nick);
 const clean = (s, n) => String(s == null ? '' : s).replace(/[<>&"'`]/g, '').trim().slice(0, n);
 const hash = (v, salt) => crypto.scryptSync(String(v), salt, 32).toString('hex');
 
@@ -21,7 +26,7 @@ const hash = (v, salt) => crypto.scryptSync(String(v), salt, 32).toString('hex')
 function loadRooms() {
   try {
     JSON.parse(fs.readFileSync(FILE, 'utf8')).forEach(r => {
-      r.players = new Map(); r.hostId = null; r.voice = new Set();
+      r.players = new Map(); r.hostId = null; r.voice = new Set(); r.bans = r.bans || [];
       rooms.set(r.id, r); RID = Math.max(RID, parseInt(String(r.id).slice(1), 10) || 0);
     });
     console.log('Wczytano lobby:', rooms.size);
@@ -34,14 +39,14 @@ function persist() {
     try {
       fs.writeFileSync(FILE, JSON.stringify([...rooms.values()].map(r => ({
         id: r.id, name: r.name, max: r.max, need: r.need, ver: r.ver, started: r.started,
-        ownerH: r.ownerH, passH: r.passH, salt: r.salt, save: r.save, last: r.last }))));
+        ownerH: r.ownerH, passH: r.passH, salt: r.salt, save: r.save, last: r.last, bans: r.bans }))));
     } catch (e) { console.log('Zapis nieudany:', e.message); }
   }, 2000);
 }
 loadRooms();
 
 // ---------- widoki ----------
-const plist = r => [...r.players].map(([id, p]) => ({ id, nick: p.nick }));
+const plist = r => [...r.players].map(([id, p]) => ({ id, nick: p.nick, adm: p.adm || null }));
 const pub = (r, owner) => ({ id: r.id, name: r.name, cur: r.players.size, max: r.max, need: r.need, started: r.started, ver: r.ver,
   lock: !!r.passH, mine: !!(owner && r.ownerH && hash(owner, 'o') === r.ownerH) });
 const state = r => ({ ...pub(r), hostId: r.hostId, players: plist(r), own: [...r.players].filter(([, p]) => p.own).map(([id]) => id) });
@@ -72,7 +77,7 @@ function leave(s) {
 function join(s, r, d, own) {
   leave(s);
   if (r.players.size === 0) { r.ver = d.ver | 0 || r.ver; }          // puste lobby przyjmuje wersję wchodzącego
-  r.players.set(s.id, { nick: clean(d.nick, 14) || 'Gracz', own });
+  r.players.set(s.id, { nick: fixNick(s, clean(d.nick, 14) || 'Gracz'), own, adm: s.data.admin || null });
   s.join(r.id); s.data.room = r.id; r.last = Date.now();
   const noHost = !r.hostId || !r.players.has(r.hostId);
   if (noHost) r.hostId = s.id;
@@ -82,18 +87,19 @@ function join(s, r, d, own) {
 }
 
 io.on('connection', s => {
-  s.data.room = null; s.data.lastChat = 0;
+  s.data.room = null; s.data.lastChat = 0; s.data.bad = 0;
+  s.data.ip = ((s.handshake && s.handshake.headers && s.handshake.headers['x-forwarded-for']) || '').split(',')[0].trim() || (s.handshake && s.handshake.address) || '';
   const isOwner = (r, tok) => !!(tok && r.ownerH && hash(tok, 'o') === r.ownerH);
 
   s.on('lobbies:get', (d, ack) => { if (typeof ack === 'function') ack([...rooms.values()].map(r => pub(r, d && d.owner))); });
 
   s.on('lobby:create', (d, ack) => {
-    if (typeof ack !== 'function') return; d = d || {};
+    if (typeof ack !== 'function') return; d = d || {}; s.data.uid = clean(d.uid, 40);
     const max = Math.max(2, Math.min(50, (d.max | 0) || 10)), need = Math.max(2, Math.min(max, (d.need | 0) || 2));
     const salt = crypto.randomBytes(8).toString('hex'), pass = typeof d.pass === 'string' ? d.pass.slice(0, 24) : '';
     const r = { id: 'r' + (++RID), name: clean(d.name, 24) || 'Lobby ' + RID, max, need, ver: d.ver | 0, started: false, save: null,
       ownerH: d.owner ? hash(d.owner, 'o') : null, salt, passH: pass ? hash(pass, salt) : null, last: Date.now(),
-      players: new Map(), hostId: null, voice: new Set() };
+      players: new Map(), hostId: null, voice: new Set(), bans: [] };
     rooms.set(r.id, r);
     join(s, r, d, true); ack({ ok: true, id: r.id });
   });
@@ -103,8 +109,10 @@ io.on('connection', s => {
     let r = d.id ? rooms.get(d.id) : null;
     if (!r && d.name) { const q = clean(d.name, 24).toLowerCase(); r = [...rooms.values()].find(x => x.name.toLowerCase() === q) || [...rooms.values()].find(x => x.name.toLowerCase().includes(q)); }
     if (!r) return ack({ ok: false, err: 'nf' });
+    s.data.uid = clean(d.uid, 40);
+    if (!s.data.admin && r.bans && (r.bans.includes('u:' + s.data.uid) || (s.data.ip && r.bans.includes('i:' + s.data.ip)))) return ack({ ok: false, err: 'ban' });
     const own = isOwner(r, d.owner);
-    if (r.passH && !own && !(typeof d.pass === 'string' && hash(d.pass, r.salt) === r.passH)) return ack({ ok: false, err: 'pass' });
+    if (r.passH && !own && !s.data.admin && !(typeof d.pass === 'string' && hash(d.pass, r.salt) === r.passH)) return ack({ ok: false, err: 'pass' });
     if (r.players.has(s.id)) return ack({ ok: true });
     if (r.players.size > 0 && r.ver && (d.ver | 0) !== r.ver) return ack({ ok: false, err: 'ver', hv: r.ver });
     if (r.players.size >= r.max) return ack({ ok: false, err: 'full' });
@@ -112,6 +120,30 @@ io.on('connection', s => {
   });
 
   s.on('lobby:leave', () => leave(s));
+
+  // ---------- konta admina ----------
+  s.on('admin:login', (d, ack) => {
+    d = d || {}; const reply = o => typeof ack === 'function' && ack(o);
+    if (s.data.bad >= 5) return reply({ ok: false });
+    if (sha(d.code) !== ADMIN_HASH || !ADMINS.includes(d.who)) { s.data.bad++; return reply({ ok: false }); }
+    s.data.admin = d.who;
+    const r = rooms.get(s.data.room), p = r && r.players.get(s.id);
+    if (p) { p.adm = d.who; p.nick = d.who; io.to(r.id).emit('lobby:state', state(r)); }
+    reply({ ok: true });
+  });
+  s.on('admin:logout', () => {
+    s.data.admin = null;
+    const r = rooms.get(s.data.room), p = r && r.players.get(s.id);
+    if (p) { p.adm = null; io.to(r.id).emit('lobby:state', state(r)); }
+  });
+  s.on('admin:ban', (d, ack) => {
+    d = d || {}; const r = rooms.get(s.data.room), tg = io.sockets.sockets.get(d.id), reply = o => typeof ack === 'function' && ack(o);
+    if (!s.data.admin || !r || !tg || tg.data.room !== r.id || tg.data.admin || tg.id === s.id) return reply({ ok: false });
+    r.bans = r.bans || [];
+    if (tg.data.uid) r.bans.push('u:' + tg.data.uid);
+    if (tg.data.ip) r.bans.push('i:' + tg.data.ip);
+    tg.emit('g:banned', {}); leave(tg); persist(); reply({ ok: true });
+  });
 
   s.on('lobby:delete', (d, ack) => {
     d = d || {}; const r = rooms.get(d.id);
@@ -123,8 +155,8 @@ io.on('connection', s => {
 
   s.on('nick', n => {
     const r = rooms.get(s.data.room), nick = clean(n, 14), p = r && r.players.get(s.id);
-    if (!p || !nick) return;
-    p.nick = nick; io.to(r.id).emit('lobby:state', state(r));
+    if (!p || !nick || s.data.admin) return;
+    p.nick = fixNick(s, nick); io.to(r.id).emit('lobby:state', state(r));
   });
 
   s.on('lobby:start', () => {
@@ -148,7 +180,7 @@ io.on('connection', s => {
   s.on('g:act', (m, ack) => {
     const r = rooms.get(s.data.room); if (!r || !r.started || !m || typeof m !== 'object') return ack && ack({ ok: false });
     const host = io.sockets.sockets.get(r.hostId); if (!host) return ack && ack({ ok: false });
-    host.timeout(3000).emit('g:act', { from: s.id, t: String(m.t), d: m.d }, (err, res) => { if (typeof ack === 'function') ack(err ? { ok: false } : res); });
+    host.timeout(3000).emit('g:act', { from: s.id, adm: s.data.admin || null, t: String(m.t), d: m.d }, (err, res) => { if (typeof ack === 'function') ack(err ? { ok: false } : res); });
   });
 
   // ---------- czat ----------

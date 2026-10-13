@@ -39,16 +39,23 @@ function persist() {
     try {
       fs.writeFileSync(FILE, JSON.stringify([...rooms.values()].map(r => ({
         id: r.id, name: r.name, max: r.max, need: r.need, ver: r.ver, started: r.started,
-        ownerH: r.ownerH, passH: r.passH, salt: r.salt, save: r.save, last: r.last, bans: r.bans }))));
+        ownerH: r.ownerH, passH: r.passH, salt: r.salt, save: r.save, last: r.last, bans: r.bans, cat: r.cat, official: r.official }))));
     } catch (e) { console.log('Zapis nieudany:', e.message); }
   }, 2000);
 }
 loadRooms();
+// 5 oficjalnych serwerów RP (stałe, bez hasła; nie da się ich usunąć)
+[['RP: Osiedle Okmiany', 50], ['RP: Halloween Market', 50], ['RP: Sklepowa Mafia', 30], ['RP: Nocna Zmiana', 20], ['RP: Dyskont u Szefa', 50]].forEach(([name, max]) => {
+  if ([...rooms.values()].some(r => r.official && r.name === name)) return;
+  rooms.set('r' + (++RID), { id: 'r' + RID, name, max, need: 2, ver: 0, started: false, save: null, ownerH: null, salt: crypto.randomBytes(8).toString('hex'),
+    passH: null, last: Date.now(), players: new Map(), hostId: null, voice: new Set(), bans: [], cat: 'rp', official: true });
+});
+persist();
 
 // ---------- widoki ----------
 const plist = r => [...r.players].map(([id, p]) => ({ id, nick: p.nick, adm: p.adm || null }));
 const pub = (r, owner) => ({ id: r.id, name: r.name, cur: r.players.size, max: r.max, need: r.need, started: r.started, ver: r.ver,
-  lock: !!r.passH, mine: !!(owner && r.ownerH && hash(owner, 'o') === r.ownerH) });
+  cat: r.cat || 'normal', official: !!r.official, lock: !!r.passH, mine: !!(owner && r.ownerH && hash(owner, 'o') === r.ownerH) });
 const state = r => ({ ...pub(r), hostId: r.hostId, players: plist(r), own: [...r.players].filter(([, p]) => p.own).map(([id]) => id) });
 let lastPush = 0, pushTimer = null;
 function pushList() {
@@ -99,7 +106,7 @@ io.on('connection', s => {
     const salt = crypto.randomBytes(8).toString('hex'), pass = typeof d.pass === 'string' ? d.pass.slice(0, 24) : '';
     const r = { id: 'r' + (++RID), name: clean(d.name, 24) || 'Lobby ' + RID, max, need, ver: d.ver | 0, started: false, save: null,
       ownerH: d.owner ? hash(d.owner, 'o') : null, salt, passH: pass ? hash(pass, salt) : null, last: Date.now(),
-      players: new Map(), hostId: null, voice: new Set(), bans: [] };
+      players: new Map(), hostId: null, voice: new Set(), bans: [], cat: d.cat === 'rp' ? 'rp' : 'normal' };
     rooms.set(r.id, r);
     join(s, r, d, true); ack({ ok: true, id: r.id });
   });
@@ -209,7 +216,7 @@ io.on('connection', s => {
 // sprzątanie starych, pustych lobby
 setInterval(() => {
   const lim = Date.now() - IDLE_DAYS * 864e5; let ch = false;
-  for (const [id, r] of rooms) if (r.players.size === 0 && (r.last || 0) < lim) { rooms.delete(id); ch = true; }
+  for (const [id, r] of rooms) if (!r.official && r.players.size === 0 && (r.last || 0) < lim) { rooms.delete(id); ch = true; }
   if (ch) { persist(); pushList(); }
 }, 6 * 3600e3);
 
